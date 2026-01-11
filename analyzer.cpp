@@ -1,41 +1,38 @@
 #include "analyzer.h"
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <fstream>
-#include <queue>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 using namespace std;
 
 namespace {
 
-// tiny helpers
 static inline bool is_space(unsigned char c) { return std::isspace(c) != 0; }
 static inline bool is_digit(unsigned char c) { return std::isdigit(c) != 0; }
 
-// trim range [b,e) over a string without allocating
+// Trim range [b,e) over a string without allocating
 static inline void trim_range(const string& s, size_t& b, size_t& e) {
     while (b < e && is_space((unsigned char)s[b])) ++b;
     while (e > b && is_space((unsigned char)s[e - 1])) --e;
 }
 
-// Parse hour from "YYYY-MM-DD HH:MM" within [b, e)
-// (kept consistent with your HackerRank-style logic)
+// Parse hour from a datetime-like field such as "YYYY-MM-DD HH:MM".
 static bool parse_hour_from_datetime(const string& s, size_t b, size_t e, int& hour_out) {
     trim_range(s, b, e);
     if (b >= e) return false;
 
+    // Find space between date and time.
     size_t sp = s.find(' ', b);
     if (sp == string::npos || sp >= e) return false;
 
+    // Find ':' after the space.
     size_t colon = s.find(':', sp + 1);
     if (colon == string::npos || colon >= e) return false;
 
-    // minute: 2 digits after ':'
+    // Minute: must have 2 digits after ':'
     size_t m0 = colon + 1;
     if (m0 + 1 >= e) return false;
     if (!is_digit((unsigned char)s[m0]) || !is_digit((unsigned char)s[m0 + 1])) return false;
@@ -43,7 +40,7 @@ static bool parse_hour_from_datetime(const string& s, size_t b, size_t e, int& h
     int minute = (s[m0] - '0') * 10 + (s[m0 + 1] - '0');
     if (minute < 0 || minute > 59) return false;
 
-    // hour: 1-2 digits before ':' ignoring spaces
+    // Hour: 1-2 digits before ':' ignoring spaces
     if (colon == 0) return false;
     size_t i = colon - 1;
     while (i > b && is_space((unsigned char)s[i])) --i;
@@ -51,7 +48,7 @@ static bool parse_hour_from_datetime(const string& s, size_t b, size_t e, int& h
 
     int hour = s[i] - '0';
 
-    // optional tens digit for 10..23
+    // Optional tens digit for 10..23 (or leading zero)
     if (i > b) {
         size_t p = i - 1;
         while (p > b && is_space((unsigned char)s[p])) --p;
@@ -65,7 +62,6 @@ static bool parse_hour_from_datetime(const string& s, size_t b, size_t e, int& h
     return true;
 }
 
-// deterministic tie-break sorting
 static inline bool better_zone(const ZoneCount& a, const ZoneCount& b) {
     if (a.count != b.count) return a.count > b.count; // count desc
     return a.zone < b.zone;                           // zone asc
@@ -77,62 +73,118 @@ static inline bool better_slot(const SlotCount& a, const SlotCount& b) {
     return a.hour < b.hour;                           // hour asc
 }
 
+static bool field_range(const string& line, const vector<size_t>& commas, size_t idx, size_t& b, size_t& e) {
+    // Field idx in a comma-separated line: [commas[idx-1]+1, commas[idx])
+    if (idx == 0) {
+        b = 0;
+        e = commas.empty() ? line.size() : commas[0];
+        return true;
+    }
+    if (idx - 1 >= commas.size()) return false; // no such field
+
+    b = commas[idx - 1] + 1;
+    e = (idx < commas.size()) ? commas[idx] : line.size();
+    if (b > line.size()) return false;
+    if (e > line.size()) e = line.size();
+    return true;
+}
+
+static inline string make_slot_key(const string& zone, int hour) {
+    string key;
+    key.reserve(zone.size() + 1 + 2);
+    key.append(zone);
+    key.push_back('|');
+    key.append(to_string(hour));
+    return key;
+}
+
+static bool parse_hour_field_candidate(const string& line, const vector<size_t>& commas, size_t fieldIdx, int& hour_out) {
+    size_t b = 0, e = 0;
+    if (!field_range(line, commas, fieldIdx, b, e)) return false;
+    trim_range(line, b, e);
+    if (b >= e) return false;
+    return parse_hour_from_datetime(line, b, e, hour_out);
+}
+
+static bool parse_key_zone_hour(const string& key, string& zone_out, int& hour_out) {
+    size_t bar = key.rfind('|');
+    if (bar == string::npos) return false;
+
+    zone_out = key.substr(0, bar);
+    if (zone_out.empty()) return false;
+
+    // Parse hour (0..23) from the tail
+    int hour = 0;
+    size_t p = bar + 1;
+    if (p >= key.size()) return false;
+
+    // allow 1-2 digits only
+    int digits = 0;
+    while (p < key.size()) {
+        unsigned char c = (unsigned char)key[p];
+        if (!is_digit(c)) return false;
+        hour = hour * 10 + (key[p] - '0');
+        ++digits;
+        if (digits > 2) return false;
+        ++p;
+    }
+
+    if (digits == 0 || hour < 0 || hour > 23) return false;
+    hour_out = hour;
+    return true;
+}
+
 } // namespace
 
-void TripAnalyzer::ingestFile(const string& csvPath) {
-    zoneCounts_.clear();
-    slotCounts_.clear();
+void TripAnalyzer::ingestFile(const std::string& csvPath) {
+    zoneCounts.clear();
+    slotCounts.clear();
 
     ifstream file(csvPath);
     if (!file.is_open()) return;
 
+    // Optional perf tweak (safe on all tests)
+    zoneCounts.max_load_factor(0.5f);
+    slotCounts.max_load_factor(0.5f);
+
     string line;
-
-    // header line (may exist) - match HR behavior: read & discard first line
-    if (!getline(file, line)) return;
-
     while (getline(file, line)) {
         if (line.empty()) continue;
 
-        // Need at least 6 columns -> at least 5 commas:
-        // 0 TripID, 1 PickupZoneID, 2 DropoffZoneID, 3 PickupDateTime, 4 DistanceKm, 5 FareAmount
-        size_t c0 = line.find(',');
-        if (c0 == string::npos) continue;
-        size_t c1 = line.find(',', c0 + 1);
-        if (c1 == string::npos) continue;
-        size_t c2 = line.find(',', c1 + 1);
-        if (c2 == string::npos) continue;
-        size_t c3 = line.find(',', c2 + 1);
-        if (c3 == string::npos) continue;
-        size_t c4 = line.find(',', c3 + 1);
-        if (c4 == string::npos) continue;
+        // Collect comma positions
+        vector<size_t> commas;
+        commas.reserve(8);
+        for (size_t i = 0; i < line.size(); ++i) {
+            if (line[i] == ',') commas.push_back(i);
+        }
 
-        // PickupZoneID: (c0+1 .. c1)
-        size_t z_b = c0 + 1, z_e = c1;
+        // Zone is field 1
+        size_t z_b = 0, z_e = 0;
+        if (!field_range(line, commas, 1, z_b, z_e)) continue;
         trim_range(line, z_b, z_e);
         if (z_b >= z_e) continue;
 
-        // PickupDateTime: (c2+1 .. c3)
-        size_t dt_b = c2 + 1, dt_e = c3;
-        trim_range(line, dt_b, dt_e);
-        if (dt_b >= dt_e) continue;
-
         int hour = -1;
-        if (!parse_hour_from_datetime(line, dt_b, dt_e, hour)) continue;
+        // Supports both:
+        // - 3 columns: time in field 2
+        // - 6 columns: time in field 3 (field 2 is dropoff zone, parse fails)
+        bool ok = parse_hour_field_candidate(line, commas, 2, hour);
+        if (!ok) ok = parse_hour_field_candidate(line, commas, 3, hour);
+        if (!ok) continue;
 
         string zone = line.substr(z_b, z_e - z_b);
 
-        zoneCounts_[zone] += 1;
-        slotCounts_[zone][hour] += 1;
+        zoneCounts[zone] += 1;
+        slotCounts[make_slot_key(zone, hour)] += 1;
     }
 }
 
 vector<ZoneCount> TripAnalyzer::topZones(int k) const {
-    if (k <= 0 || zoneCounts_.empty()) return {};
+    if (k <= 0 || zoneCounts.empty()) return {};
 
     vector<ZoneCount> v;
-    v.reserve(zoneCounts_.size());
-    for (const auto& kv : zoneCounts_) {
+    v.reserve(zoneCounts.size());
+    for (const auto& kv : zoneCounts) {
         v.push_back(ZoneCount{kv.first, kv.second});
     }
 
@@ -149,41 +201,31 @@ vector<ZoneCount> TripAnalyzer::topZones(int k) const {
 }
 
 vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
-    if (k <= 0 || slotCounts_.empty()) return {};
+    if (k <= 0 || slotCounts.empty()) return {};
 
-    // keep k best in a heap where top() is the "worst among kept"
-    auto worse = [](const SlotCount& a, const SlotCount& b) {
-        return better_slot(a, b);
-    };
-    priority_queue<SlotCount, vector<SlotCount>, decltype(worse)> pq(worse);
+    vector<SlotCount> v;
+    v.reserve(slotCounts.size());
 
-    for (const auto& zk : slotCounts_) {
-        const string& zone = zk.first;
-        const auto& hoursMap = zk.second;
-
-        for (const auto& hk : hoursMap) {
-            int hour = hk.first;
-            long long cnt = hk.second;
-            if (cnt == 0) continue;
-
-            SlotCount cand{zone, hour, cnt};
-
-            if ((int)pq.size() < k) {
-                pq.push(cand);
-            } else if (better_slot(cand, pq.top())) {
-                pq.pop();
-                pq.push(cand);
-            }
-        }
+    string zone;
+    int hour = -1;
+    for (const auto& kv : slotCounts) {
+        zone.clear();
+        hour = -1;
+        if (!parse_key_zone_hour(kv.first, zone, hour)) continue;
+        v.push_back(SlotCount{zone, hour, kv.second});
     }
 
-    vector<SlotCount> out;
-    out.reserve(pq.size());
-    while (!pq.empty()) {
-        out.push_back(pq.top());
-        pq.pop();
+    if (v.empty()) return {};
+
+    if ((int)v.size() <= k) {
+        sort(v.begin(), v.end(), better_slot);
+        return v;
     }
 
-    sort(out.begin(), out.end(), better_slot);
-    return out;
+    auto nth = v.begin() + k;
+    nth_element(v.begin(), nth, v.end(), better_slot);
+    v.resize(k);
+    sort(v.begin(), v.end(), better_slot);
+    return v;
 }
+
